@@ -136,9 +136,8 @@ def fit_single_lc(
 
 
 class BandReferenceLevels(sncosmo.PropagationEffect):
-    """Parameter container; additive levels are applied in bandflux, not the SED."""
-    _minwave = 0.0
-    _maxwave = np.inf
+    """Expose baseline parameters to sncosmo; leave the source SED unchanged."""
+    _minwave, _maxwave = 0.0, np.inf
 
     def __init__(self, filters):
         self._param_names = list(filters)
@@ -150,11 +149,7 @@ class BandReferenceLevels(sncosmo.PropagationEffect):
 
 
 class DifferenceSALTModel(sncosmo.Model):
-    """SALT3 + one signed constant per observer band, expressed in nJy.
-
-    For photometric fits with modelcov=False only. Reference levels are
-    nuisance parameters, not measured template fluxes or an SED component.
-    """
+    """SALT3 plus signed per-band nJy levels; AB photometry, modelcov=False only."""
     def __init__(self, filters, source="salt3"):
         self.reference_filters = tuple(filters)
         super().__init__(source=source,
@@ -162,55 +157,39 @@ class DifferenceSALTModel(sncosmo.Model):
                          effect_names=["mw", "ref"], effect_frames=["obs", "obs"])
 
     def __copy__(self):
-        copied = type(self)(self.reference_filters, source=self.source)
-        copied.parameters = self.parameters.copy()
-        return copied
+        # fit_lc copies its model; preserve this subclass and its baselines.
+        model = type(self)(self.reference_filters, source=self.source)
+        model.parameters = self.parameters.copy()
+        return model
 
     def bandflux(self, band, time, zp=None, zpsys=None):
+        if zp is None or not np.all(np.asarray(zpsys) == "ab"):
+            raise ValueError("Band baselines require an explicit AB zeropoint")
         flux = np.asarray(super().bandflux(band, time, zp=zp, zpsys=zpsys))
         bands = np.broadcast_to(np.asarray(band), flux.shape)
-        offset = np.zeros_like(flux)
-        if zp is not None:
-            zps = np.broadcast_to(np.asarray(zp), flux.shape)
-            systems = np.broadcast_to(np.asarray(zpsys), flux.shape)
+        baseline = np.zeros_like(flux)
         for item in set(bands.flat):
-            bp = sncosmo.get_bandpass(item)
-            filt = bp.name.removeprefix("lynx_lsst_")
-            if filt not in self.reference_filters:
-                raise ValueError(f"No reference parameter for band {bp.name}")
-            mask = bands == item
-            # Convert nJy (AB zp=31.4) to photons, then to the requested units.
-            photons = self.get("ref" + filt) * 10**(-0.4 * 31.4)
-            photons *= sncosmo.get_magsystem("ab").zpbandflux(bp)
-            if zp is None:
-                offset[mask] = photons
-            else:
-                for system in set(systems[mask].flat):
-                    selected = mask & (systems == system)
-                    offset[selected] = (photons * 10**(0.4 * zps[selected]) /
-                                        sncosmo.get_magsystem(system).zpbandflux(bp))
-        result = flux + offset
-        return result.item() if result.ndim == 0 else result
+            name = sncosmo.get_bandpass(item).name.removeprefix("lynx_lsst_")
+            baseline[bands == item] = self.get("ref" + name)
+        # The baseline is in nJy (AB zp=31.4); respect sncosmo's requested zp.
+        flux = flux + baseline * 10**(0.4 * (np.asarray(zp) - 31.4))
+        return flux.item() if flux.ndim == 0 else flux
 
     def bandfluxcov(self, *args, **kwargs):
-        raise ValueError("Reference-level retry currently requires modelcov=False")
+        raise ValueError("Band-baseline fitting requires modelcov=False")
 
 
 legacy_fields = ["success", "chisq", "ndof", "z", "t0", "x0", "x1", "c"]
 baseline_numeric = (["legacy_" + key for key in legacy_fields] +
                     ["baseline_recovered", "baseline_nband", "baseline_delta_bic"] +
-                    ["baseline_" + band + suffix for band in "ugrizy"
-                     for suffix in ["", "_err"]])
-baseline_text = ["fit_model", "baseline_status"]
-salt_output_columns = saltres_cols + baseline_numeric + baseline_text
-salt_output_dtypes = ([np.float64] * (len(saltres_cols) - 2) + [int, str] +
-                      [np.float64] * len(baseline_numeric) + [str] * len(baseline_text))
+                    ["baseline_" + band + suffix for band in "ugrizy" for suffix in ["", "_err"]])
+salt_output_columns = saltres_cols + baseline_numeric + ["fit_model", "baseline_status"]
+salt_output_dtypes = dtypes + [np.float64] * len(baseline_numeric) + [str, str]
 
 
 def normalize_salt_output(result):
-    """Use identical scalar types in legacy/recovered/empty HATS partitions."""
-    return {name: dtype(result[name])
-            for name, dtype in zip(salt_output_columns, salt_output_dtypes)}
+    """Keep identical column types in original, recovered and empty partitions."""
+    return {name: dtype(result[name]) for name, dtype in zip(salt_output_columns, salt_output_dtypes)}
 
 
 def passes_salt_cuts(result):
@@ -219,237 +198,126 @@ def passes_salt_cuts(result):
             result["ndof"] > 0 and 0 < result["chisq"] / result["ndof"] < 20)
 
 
-def fit_single_lc_with_baselines(
-    lc, bounds=None, phase_range=(-15, 45), modelcov=False,
-    retry_band_baselines=True,
-):
-    """Keep passing SALT3 fits and retry rejected fits with per-band baselines.
+def fit_single_lc_with_baselines(lc, bounds=None, phase_range=(-15, 45), modelcov=False,
+                               retry_band_baselines=True):
+    """Keep passing SALT fits; retry failures with one constant per observed band.
 
-    The retry fits z, t0, x0, x1, c and one additive nJy constant per band.
-    It uses surviving DiaSource rows, including negative fluxes. The notebook
-    still applies its separate forced-photometry phase cuts.
-
-    The returned dictionary contains the usual SALT fields, the original
-    fit summary in legacy_*, and fitted baseline levels/errors in baseline_*.
-    SALT errors include the fitted baseline uncertainty; the full joint
-    covariance with the baselines is not exported. A fitted baseline does
-    not establish template contamination as the cause.
-
-    Set retry_band_baselines=False to keep the original fit with the same
-    output schema. The original fit_single_lc API remains unchanged.
+    Baselines are free nuisance parameters, not measured template fluxes.
+    SALT errors include baseline uncertainty; only individual baseline errors
+    are exported. The notebook's final forced-photometry phase cuts still apply.
     """
-    if bounds is None:
-        bounds = {"x1": (-4, 4), "c": (-0.4, 0.8)}
-    else:
-        bounds = bounds.copy()
-
-    legacy = fit_single_lc(
-        lc.copy(), mpbounds=bounds.copy(),
-        phase_range=phase_range, modelcov=modelcov,
-    )
-    output = _result_with_baseline_fields(legacy)
-    if not retry_band_baselines or passes_salt_cuts(legacy):
-        return normalize_salt_output(output)
-    if modelcov:
-        raise ValueError("Band-baseline retry is only implemented for modelcov=False")
-
-    try:
-        candidate, status = _find_reference_fit(lc, legacy, bounds, phase_range)
-        output["baseline_status"] = status
-        if candidate is not None:
-            _record_reference_fit(output, candidate)
-    except (ValueError, RuntimeError, FloatingPointError) as exc:
-        output["baseline_status"] = "reference_fit_error: " + str(exc)
-    return normalize_salt_output(output)
-
-
-def _result_with_baseline_fields(legacy):
-    """Preserve the original fit and initialize a consistent output schema."""
+    bounds = {"x1": (-4, 4), "c": (-0.4, 0.8)} if bounds is None else bounds.copy()
+    legacy = fit_single_lc(lc.copy(), mpbounds=bounds.copy(),
+                           phase_range=phase_range, modelcov=modelcov)
     output = dict(legacy)
     output.update({name: np.nan for name in baseline_numeric})
     output.update({"legacy_" + key: legacy[key] for key in legacy_fields})
-    output.update(
-        baseline_recovered=0.0, fit_model="salt3", baseline_status="not_needed",
-    )
+    output.update(baseline_recovered=0.0, fit_model="salt3", baseline_status="not_needed")
     for band in "ugrizy":
         output["baseline_" + band] = 0.0
-    return output
+    if not retry_band_baselines or passes_salt_cuts(legacy):
+        return normalize_salt_output(output)
+    if modelcov:
+        raise ValueError("Band-baseline fitting requires modelcov=False")
+    output["baseline_status"] = "no_acceptable_reference_fit"
 
+    try:
+        # Prepare finite signed difference fluxes; retain negative measurements.
+        prefix = "diaSource_dia_object_lc."
+        data = Table({
+            "time": np.asarray(lc[prefix + "midpointMjdTai"], dtype=float),
+            "flux": np.asarray(lc[prefix + "psfFlux"], dtype=float),
+            "fluxerr": np.asarray(lc[prefix + "psfFluxErr"], dtype=float),
+            "band": np.asarray(lc[prefix + "band"], dtype=str),
+        })
+        valid = np.isfinite(data["time"] + data["flux"] + data["fluxerr"]) & (data["fluxerr"] > 0)
+        data = data[valid]
+        data["band"] = np.char.add("lynx_lsst_", np.asarray(data["band"], dtype=str))
+        data["zp"] = 31.4
+        data["zpsys"] = "ab"
+        zest, zerr = float(lc["z_est"]), float(lc.get("z_est_err", 0.15))
+        zlo, zhi = max(0.0, zest - 3*zerr), zest + 3*zerr
+        bounds["z"] = (zlo, zhi)
+        dust = float(sfdmap.SFDMap().ebv(lc["ra_dia_object_lc"], lc["dec_dia_object_lc"]))
+        if not np.isfinite(dust) or dust >= 0.25:
+            return normalize_salt_output(output)
+        base = sncosmo.Model(source="salt3", effects=[sncosmo.F99Dust()],
+                             effect_names=["mw"], effect_frames=["obs"])
+        base.set(mwebv=dust)
+        data = data[np.all(base.bandoverlap(data["band"], z=[zlo, zhi]), axis=1)]
+        bands = sorted({str(b).removeprefix("lynx_lsst_") for b in data["band"]})
+        if len(bands) < 3 or len(data) <= 5 + len(bands):
+            output["baseline_status"] = "insufficient_reference_fit_support"
+            return normalize_salt_output(output)
 
-def _difference_photometry(lc):
-    """Build the fit table, keeping finite signed fluxes and positive errors."""
-    time = np.asarray(lc["diaSource_dia_object_lc.midpointMjdTai"], dtype=float)
-    flux = np.asarray(lc["diaSource_dia_object_lc.psfFlux"], dtype=float)
-    error = np.asarray(lc["diaSource_dia_object_lc.psfFluxErr"], dtype=float)
-    filters = np.asarray(lc["diaSource_dia_object_lc.band"], dtype=str)
-    valid = np.isfinite(time + flux + error) & (error > 0)
-    return Table({
-        "time": time[valid],
-        "flux": flux[valid],
-        "fluxerr": error[valid],
-        "band": np.char.add("lynx_lsst_", filters[valid]),
-        "zp": np.full(valid.sum(), 31.4),
-        "zpsys": np.full(valid.sum(), "ab"),
-    })
+        # Seed from the band with the clearest variation; a constant cannot change its range.
+        rows_by_band = {b: data[data["band"] == "lynx_lsst_" + b] for b in bands}
+        seed_rows = max(rows_by_band.values(),
+                        key=lambda rows: np.ptp(rows["flux"]) / np.median(rows["fluxerr"]))
+        salt_parameters = ["z", "t0", "x0", "x1", "c"]
+        options = dict(bounds=bounds, modelcov=False, guess_z=False, guess_t0=False,
+                       guess_amplitude=False, maxcall=3000, warn=False)
+        candidates = []
+        # Try the peak-flux redshift estimate, half that value, and the original fitted redshift.
+        for zstart in dict.fromkeys([zest, max(zlo + 1e-4, zest / 2), legacy.get("z", np.nan)]):
+            if not np.isfinite(zstart) or not zlo < zstart < zhi:
+                continue
+            try:
+                model = DifferenceSALTModel(bands)
+                model.set(z=zstart, mwebv=dust, x0=1.0, x1=0.0, c=0.0, t0=0.0)
+                grid = np.linspace(-15, 40, 111) * (1 + zstart)
+                curve = model.bandflux(seed_rows["band"][0], grid, zp=31.4, zpsys="ab")
+                t0 = float(seed_rows["time"][np.argmax(seed_rows["flux"])]) - grid[np.argmax(curve)]
+                x0 = max(np.ptp(seed_rows["flux"]) / np.max(curve), 1e-12)
+                model.set(t0=t0, x0=x0)
+                for band, rows in rows_by_band.items():
+                    prediction = model.bandflux(rows["band"], rows["time"], zp=31.4, zpsys="ab")
+                    model.set(**{"ref" + band: float(np.median(rows["flux"] - prediction))})
 
+                # Fit SALT and baselines together, then refit the final phase subset on fixed rows.
+                parameters = salt_parameters + ["ref" + b for b in bands]
+                result, model = sncosmo.fit_lc(
+                    data, model, parameters, phase_range=phase_range, **options)
+                selected = data[result.data_mask]
+                active = sorted({str(b).removeprefix("lynx_lsst_") for b in selected["band"]})
+                if len(active) < 3 or len(selected) <= 5 + len(active):
+                    continue
+                parameters = salt_parameters + ["ref" + b for b in active]
+                result, model = sncosmo.fit_lc(selected, model, parameters, **options)
+                flat = flatten_result(result)
+                phases = (selected["time"] - flat["t0"]) / (1 + flat["z"])
+                if (not passes_salt_cuts(flat) or result.covariance is None or
+                        np.any(phases < phase_range[0]) or np.any(phases > phase_range[1])):
+                    continue
+                # Reject degenerate fits, amplitudes below five sigma, and redshift boundaries.
+                sigma = np.sqrt(np.diag(result.covariance))
+                correlation = result.covariance / np.outer(sigma, sigma)
+                if (not np.all(np.isfinite(correlation)) or np.min(np.linalg.eigvalsh(correlation)) <= 1e-10 or
+                        flat["x0"] <= 5 * flat["x0_err"] or min(flat["z"] - zlo, zhi - flat["z"]) <= 1e-4):
+                    continue
 
-def _observed_bands(data):
-    return sorted({str(band).removeprefix("lynx_lsst_") for band in data["band"]})
+                # Accept extra parameters only if BIC improves on exactly the same observations.
+                base.set(**{key: flat[key] for key in salt_parameters + ["mwebv"]})
+                zero, _ = sncosmo.fit_lc(selected, base, salt_parameters, **options)
+                delta_bic = zero.chisq - result.chisq - len(active)*np.log(len(selected))
+                if zero.success and np.isfinite(delta_bic) and delta_bic > 0:
+                    candidates.append((len(selected), -result.chisq/result.ndof, flat, active, delta_bic))
+            except (ValueError, RuntimeError, FloatingPointError):
+                continue
 
-
-def _find_reference_fit(lc, legacy, bounds, phase_range):
-    """Try three redshift starts and choose a supported, acceptable solution."""
-    no_fit = (None, "no_acceptable_reference_fit")
-    data = _difference_photometry(lc)
-    zest = float(lc["z_est"])
-    zerr = float(lc.get("z_est_err", 0.15))
-    zlo, zhi = max(0.0, zest - 3*zerr), zest + 3*zerr
-    fitbounds = dict(bounds, z=(zlo, zhi))
-    dust = float(sfdmap.SFDMap().ebv(lc["ra_dia_object_lc"], lc["dec_dia_object_lc"]))
-    if not np.isfinite(dust) or dust >= 0.25:
-        return no_fit
-
-    zero_model = sncosmo.Model(
-        source="salt3", effects=[sncosmo.F99Dust()],
-        effect_names=["mw"], effect_frames=["obs"],
-    )
-    zero_model.set(mwebv=dust)
-    # Require full passband support throughout the allowed redshift interval.
-    support = np.all(zero_model.bandoverlap(data["band"], z=[zlo, zhi]), axis=1)
-    data = data[support]
-    bands = _observed_bands(data)
-    if len(bands) < 3 or len(data) <= 5 + len(bands):
-        return None, "insufficient_reference_fit_support"
-
-    seed_rows = _seed_band_data(data, bands)
-    zstarts = [zest, max(zlo + 1e-4, zest / 2), legacy.get("z", np.nan)]
-    candidates = []
-    for zstart in dict.fromkeys(zstarts):
-        if not np.isfinite(zstart) or not zlo < zstart < zhi:
-            continue
-        try:
-            model = _initial_reference_model(data, bands, seed_rows, zstart, dust)
-            candidate = _fit_reference_candidate(
-                data, model, zero_model, fitbounds, phase_range,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
-        except (ValueError, RuntimeError, FloatingPointError):
-            continue
-
-    if not candidates:
-        return no_fit
-    # Prefer more retained epochs, then lower reduced chi-square.
-    best = max(candidates, key=lambda fit: (fit["n_epochs"], -fit["reduced_chisq"]))
-    return best, "accepted"
-
-
-def _seed_band_data(data, bands):
-    """Choose the band with the largest flux range relative to its errors."""
-    def variation_snr(band):
-        rows = data[data["band"] == "lynx_lsst_" + band]
-        return np.ptp(rows["flux"]) / np.median(rows["fluxerr"])
-
-    seed_band = max(bands, key=variation_snr)
-    return data[data["band"] == "lynx_lsst_" + seed_band]
-
-
-def _initial_reference_model(data, bands, seed_rows, zstart, dust):
-    """Seed SALT from the flux range, which is unchanged by a constant offset."""
-    model = DifferenceSALTModel(bands)
-    model.set(z=zstart, mwebv=dust, x0=1.0, x1=0.0, c=0.0, t0=0.0)
-    grid = np.linspace(-15, 40, 111) * (1 + zstart)
-    curve = model.bandflux(seed_rows["band"][0], grid, zp=31.4, zpsys="ab")
-    t0 = float(seed_rows["time"][np.argmax(seed_rows["flux"])]) - grid[np.argmax(curve)]
-    amplitude = max(np.ptp(seed_rows["flux"]) / np.max(curve), 1e-12)
-    model.set(t0=t0, x0=amplitude)
-
-    for band in bands:
-        rows = data[data["band"] == "lynx_lsst_" + band]
-        prediction = model.bandflux(rows["band"], rows["time"], zp=31.4, zpsys="ab")
-        model.set(**{"ref" + band: float(np.median(rows["flux"] - prediction))})
-    return model
-
-
-def _fit_from_seed(data, model, parameters, bounds, phase_range=None):
-    """Use the supplied start values rather than sncosmo's automatic guesses."""
-    return sncosmo.fit_lc(
-        data, model, parameters, bounds=bounds, modelcov=False,
-        guess_z=False, guess_t0=False, guess_amplitude=False,
-        phase_range=phase_range, maxcall=3000, warn=False,
-    )
-
-
-def _fit_reference_candidate(data, model, zero_model, bounds, phase_range):
-    """Fit one start, freeze its phase subset, then compare with zero baseline."""
-    salt_parameters = ["z", "t0", "x0", "x1", "c"]
-    parameters = salt_parameters + ["ref" + band for band in _observed_bands(data)]
-    result, fitted = _fit_from_seed(data, model, parameters, bounds, phase_range)
-
-    # Refit fixed rows, varying baselines only for bands still in the phase window.
-    selected = data[result.data_mask]
-    active_bands = _observed_bands(selected)
-    if len(active_bands) < 3 or len(selected) <= 5 + len(active_bands):
-        return None
-    parameters = salt_parameters + ["ref" + band for band in active_bands]
-    result, fitted = _fit_from_seed(selected, fitted, parameters, bounds)
-    flat = flatten_result(result)
-    if not _acceptable_reference_fit(result, flat, selected, bounds["z"], phase_range):
-        return None
-
-    # Both BIC terms must use exactly the same rows, including negative fluxes.
-    zero_model.set(**{key: flat[key] for key in salt_parameters + ["mwebv"]})
-    zero, _ = _fit_from_seed(selected, zero_model, salt_parameters, bounds)
-    delta_bic = zero.chisq - result.chisq - len(active_bands)*np.log(len(selected))
-    if not zero.success or not np.isfinite(delta_bic) or delta_bic <= 0:
-        return None
-
-    return {
-        "fit": flat,
-        "bands": active_bands,
-        "n_epochs": len(selected),
-        "reduced_chisq": result.chisq / result.ndof,
-        "delta_bic": delta_bic,
-    }
-
-
-def _acceptable_reference_fit(result, flat, selected, z_bounds, phase_range):
-    """Require the SALT cuts, phase support and an identifiable interior fit."""
-    phases = (selected["time"] - flat["t0"]) / (1 + flat["z"])
-    if not passes_salt_cuts(flat):
-        return False
-    if np.any(phases < phase_range[0]) or np.any(phases > phase_range[1]):
-        return False
-    if result.covariance is None:
-        return False
-
-    sigma = np.sqrt(np.diag(result.covariance))
-    correlation = result.covariance / np.outer(sigma, sigma)
-    if not np.all(np.isfinite(correlation)):
-        return False
-    if np.min(np.linalg.eigvalsh(correlation)) <= 1e-10:
-        return False
-    if flat["x0"] <= 5 * flat["x0_err"]:
-        return False
-    zlo, zhi = z_bounds
-    if min(flat["z"] - zlo, zhi - flat["z"]) <= 1e-4:
-        return False
-    return True
-
-
-def _record_reference_fit(output, candidate):
-    """Replace the active SALT result while retaining its legacy summary."""
-    fit = candidate["fit"]
-    bands = candidate["bands"]
-    output.update({key: fit[key] for key in saltres_cols if key not in ["id", "fit_error"]})
-    output.update(
-        fit_error="None", baseline_recovered=1.0,
-        fit_model="salt3_plus_band_reference", baseline_status="accepted",
-        baseline_nband=float(len(bands)), baseline_delta_bic=float(candidate["delta_bic"]),
-    )
-    for band in bands:
-        output["baseline_" + band] = fit["ref" + band]
-        output["baseline_" + band + "_err"] = fit["ref" + band + "_err"]
+        if candidates:
+            # Prefer more epochs, then smaller reduced chi-square; retain the original fit summary.
+            _, _, fit, active, delta_bic = max(candidates, key=lambda item: item[:2])
+            output.update({key: fit[key] for key in saltres_cols[:-2]})
+            output.update(fit_error="None", baseline_recovered=1.0, fit_model="salt3_plus_band_reference",
+                          baseline_status="accepted", baseline_nband=float(len(active)),
+                          baseline_delta_bic=delta_bic)
+            for band in active:
+                output["baseline_" + band] = fit["ref" + band]
+                output["baseline_" + band + "_err"] = fit["ref" + band + "_err"]
+    except (ValueError, RuntimeError, FloatingPointError) as exc:
+        output["baseline_status"] = "reference_fit_error: " + str(exc)
+    return normalize_salt_output(output)
 
 
 def lsst_model_flux(model, band, time, baseline=0.0):
