@@ -59,24 +59,53 @@ class CandidateAuditTests(unittest.TestCase):
         self.assertEqual(list(audit["_dist_arcsec"]), [0.3, 1.2])
         self.assertNotIn("in_final_sample", audit.columns)
 
+    def test_nullable_failed_fit_does_not_pass_or_crash(self):
+        fits = pd.DataFrame(
+            {
+                ID: [17],
+                "success": [None],
+                "x1": [None],
+                "c": [None],
+                "mwebv": [None],
+                "chisq": [None],
+                "ndof": [None],
+            }
+        ).astype({name: "Float64" for name in
+                  ("success", "x1", "c", "mwebv", "chisq", "ndof")})
+        audit = add_cut_flags(fits)
+        self.assertFalse(audit.loc[0, "passes_salt_parameters"])
+        self.assertFalse(audit.loc[0, "passes_salt_and_chisq"])
+        self.assertEqual(
+            audit.loc[0, "failed_cuts"],
+            "fit_failed,x1,color,mwebv,reduced_chisq",
+        )
+
     def test_projects_scalar_columns_before_materializing_catalog(self):
         class FakeCatalog:
             def __init__(self):
-                self.columns = [ID, "x1", "diaSource_dia_object_lc"]
-                self.projected = None
-
-            def __getitem__(self, columns):
-                self.projected = columns
-                return self
+                self.columns = [ID]
+                self.all_columns = [ID, "x1", "diaSource_dia_object_lc"]
 
             def compute(self):
-                return pd.DataFrame({ID: [42], "x1": [-4.0]})
+                return FakeNestedFrame({ID: [42], "x1": [-4.0]})
+
+        class FakeNestedFrame(pd.DataFrame):
+            @property
+            def _constructor(self):
+                return FakeNestedFrame
 
         fake = FakeCatalog()
-        with patch.dict("sys.modules", {"lsdb": SimpleNamespace(open_catalog=lambda _: fake)}):
+        opened = []
+
+        def open_catalog(_, columns=None):
+            opened.append(columns)
+            return fake
+
+        with patch.dict("sys.modules", {"lsdb": SimpleNamespace(open_catalog=open_catalog)}):
             result = read_scalar_catalog(Path("saved_hats"))
-        self.assertEqual(fake.projected, [ID, "x1"])
+        self.assertEqual(opened, [None, [ID, "x1"]])
         self.assertEqual(list(result[ID]), [42])
+        self.assertIs(type(result), pd.DataFrame)
 
 
 if __name__ == "__main__":

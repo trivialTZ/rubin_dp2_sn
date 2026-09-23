@@ -5,15 +5,19 @@ Filtering DP2 data to get sn candidates
 
 The full-sample notebook saves a HATS catalog at
 `outputs/saltfit_on_good_sne_after_quality_cut` before applying its SALT
-parameter and reduced-chi-square cuts. To inspect candidates that did not
-reach `final_sample.parquet`, run after the notebook has produced its saved
-catalogs:
+parameter and reduced-chi-square cuts. Its final cell automatically exports
+the diagnostic tables after `final_sample.parquet` is written. To rerun just
+the export from existing saved catalogs, use:
 
 ```bash
 python candidate_audit.py
 ```
 
-This writes `outputs/salt_candidate_audit.parquet`. It retains every row in
+For the full-sample run this writes `outputs/salt_candidate_audit.parquet`.
+When the notebook runs with `DDF=True`, its export cell adds `_ddf` to both
+audit filenames. The standalone command uses full-sample defaults; to rerun
+a DDF export, use that notebook cell or pass the matching input and output
+paths. The SALT audit retains every row in
 the saved pre-cut SALT catalog, including failed fits and boundary values,
 and adds one Boolean column per notebook cut, `failed_cuts`, and
 `in_final_sample` when the final Parquet file is present. It exports scalar

@@ -73,14 +73,16 @@ def add_cut_flags(fits: pd.DataFrame, final_ids=None) -> pd.DataFrame:
     chisq = pd.to_numeric(out["chisq"], errors="coerce")
     ndof = pd.to_numeric(out["ndof"], errors="coerce")
 
-    out["passes_fit_success"] = success.eq(1)
-    out["passes_x1"] = x1.gt(-3.99) & x1.lt(3.99)
-    out["passes_color"] = color.gt(-0.399) & color.lt(0.799)
-    out["passes_mwebv"] = mwebv.lt(0.25)
+    out["passes_fit_success"] = success.eq(1).fillna(False).astype(bool)
+    out["passes_x1"] = (x1.gt(-3.99) & x1.lt(3.99)).fillna(False).astype(bool)
+    out["passes_color"] = (
+        color.gt(-0.399) & color.lt(0.799)
+    ).fillna(False).astype(bool)
+    out["passes_mwebv"] = mwebv.lt(0.25).fillna(False).astype(bool)
     out["reduced_chisq"] = chisq.div(ndof.where(ndof.gt(0)))
     out["passes_reduced_chisq"] = (
         out["reduced_chisq"].gt(0) & out["reduced_chisq"].lt(20)
-    )
+    ).fillna(False).astype(bool)
     parameter_flags = (
         "passes_fit_success",
         "passes_x1",
@@ -112,11 +114,15 @@ def read_scalar_catalog(path: Path, requested=SCALAR_COLUMNS) -> pd.DataFrame:
     import lsdb
 
     catalog = lsdb.open_catalog(path)
-    available = set(catalog.columns)
+    # ``columns`` may contain only HATS default_columns, not the full schema.
+    available = set(catalog.all_columns)
     columns = [name for name in requested if name in available]
     if ID not in columns:
         raise ValueError(f"{path} does not contain {ID}")
-    return catalog[columns].compute().reset_index(drop=True)
+    frame = lsdb.open_catalog(path, columns=columns).compute()
+    # LSDB returns a NestedFrame even when only scalar fields were projected.
+    # Use the ordinary pandas writer for the compact flat Parquet export.
+    return pd.DataFrame(frame.reset_index(drop=True))
 
 
 def main(argv=None):
