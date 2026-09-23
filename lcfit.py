@@ -9,7 +9,7 @@ import os
 from lightcurvelynx.astro_utils.passbands import PassbandGroup
 import numpy as np
 
-os.environ["SFD_DIR"] = "/astro/users/midai/sfdmap2/sfddata-master"
+os.environ.setdefault("SFD_DIR", "/astro/users/midai/sfdmap2/sfddata-master")
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,9 @@ class DifferenceSALTModel(sncosmo.Model):
 
 
 legacy_fields = ["success", "chisq", "ndof", "z", "t0", "x0", "x1", "c"]
+trial_fields = ["success", "chisq", "ndof", "z", "t0", "x1", "x1_err", "c"]
 baseline_numeric = (["legacy_" + key for key in legacy_fields] +
+                    ["trial_" + key for key in trial_fields] +
                     ["baseline_recovered", "baseline_nband", "baseline_delta_bic"] +
                     ["baseline_" + band + suffix for band in "ugrizy" for suffix in ["", "_err"]])
 salt_output_columns = saltres_cols + baseline_numeric + ["fit_model", "baseline_status"]
@@ -257,7 +259,7 @@ def fit_single_lc_with_baselines(lc, bounds=None, phase_range=(-15, 45), modelco
         salt_parameters = ["z", "t0", "x0", "x1", "c"]
         options = dict(bounds=bounds, modelcov=False, guess_z=False, guess_t0=False,
                        guess_amplitude=False, maxcall=3000, warn=False)
-        candidates = []
+        attempts = []
         # Try the peak-flux redshift estimate, half that value, and the original fitted redshift.
         for zstart in dict.fromkeys([zest, max(zlo + 1e-4, zest / 2), legacy.get("z", np.nan)]):
             if not np.isfinite(zstart) or not zlo < zstart < zhi:
@@ -281,37 +283,57 @@ def fit_single_lc_with_baselines(lc, bounds=None, phase_range=(-15, 45), modelco
                 selected = data[result.data_mask]
                 active = sorted({str(b).removeprefix("lynx_lsst_") for b in selected["band"]})
                 if len(active) < 3 or len(selected) <= 5 + len(active):
+                    output["baseline_status"] = "insufficient_phase_subset_support"
                     continue
                 parameters = salt_parameters + ["ref" + b for b in active]
                 result, model = sncosmo.fit_lc(selected, model, parameters, **options)
                 flat = flatten_result(result)
                 phases = (selected["time"] - flat["t0"]) / (1 + flat["z"])
-                if (not passes_salt_cuts(flat) or result.covariance is None or
-                        np.any(phases < phase_range[0]) or np.any(phases > phase_range[1])):
-                    continue
-                # Reject degenerate fits, amplitudes below five sigma, and redshift boundaries.
-                sigma = np.sqrt(np.diag(result.covariance))
-                correlation = result.covariance / np.outer(sigma, sigma)
-                if (not np.all(np.isfinite(correlation)) or np.min(np.linalg.eigvalsh(correlation)) <= 1e-10 or
-                        flat["x0"] <= 5 * flat["x0_err"] or min(flat["z"] - zlo, zhi - flat["z"]) <= 1e-4):
-                    continue
+                status, delta_bic = "accepted", np.nan
+                if not passes_salt_cuts(flat):
+                    status = "failed_salt_cuts"
+                elif np.any(phases < phase_range[0]) or np.any(phases > phase_range[1]):
+                    status = "phase_window_changed"
+                elif result.covariance is None:
+                    status = "missing_covariance"
+                else:
+                    # Reject degenerate fits, weak amplitudes, and redshift boundaries.
+                    sigma = np.sqrt(np.diag(result.covariance))
+                    correlation = result.covariance / np.outer(sigma, sigma)
+                    if (not np.all(np.isfinite(correlation)) or
+                            np.min(np.linalg.eigvalsh(correlation)) <= 1e-10):
+                        status = "degenerate_covariance"
+                    elif flat["x0"] <= 5 * flat["x0_err"]:
+                        status = "weak_amplitude"
+                    elif min(flat["z"] - zlo, zhi - flat["z"]) <= 1e-4:
+                        status = "redshift_boundary"
+                    else:
+                        # Compare the extra parameters on exactly the same observations.
+                        base.set(**{key: flat[key] for key in salt_parameters + ["mwebv"]})
+                        try:
+                            zero, _ = sncosmo.fit_lc(selected, base, salt_parameters, **options)
+                            delta_bic = zero.chisq - result.chisq - len(active)*np.log(len(selected))
+                            if not zero.success or not np.isfinite(delta_bic) or delta_bic <= 0:
+                                status = "no_bic_improvement"
+                        except (ValueError, RuntimeError, FloatingPointError) as exc:
+                            status = "comparison_fit_error: " + str(exc)
+                score = -result.chisq/result.ndof if np.isfinite(result.chisq) else -np.inf
+                attempts.append((len(selected), score, flat, active, delta_bic, status))
+            except (ValueError, RuntimeError, FloatingPointError) as exc:
+                output["baseline_status"] = "reference_fit_error: " + str(exc)
 
-                # Accept extra parameters only if BIC improves on exactly the same observations.
-                base.set(**{key: flat[key] for key in salt_parameters + ["mwebv"]})
-                zero, _ = sncosmo.fit_lc(selected, base, salt_parameters, **options)
-                delta_bic = zero.chisq - result.chisq - len(active)*np.log(len(selected))
-                if zero.success and np.isfinite(delta_bic) and delta_bic > 0:
-                    candidates.append((len(selected), -result.chisq/result.ndof, flat, active, delta_bic))
-            except (ValueError, RuntimeError, FloatingPointError):
-                continue
-
-        if candidates:
-            # Prefer more epochs, then smaller reduced chi-square; retain the original fit summary.
-            _, _, fit, active, delta_bic = max(candidates, key=lambda item: item[:2])
+        if attempts:
+            # Prefer accepted fits, then more epochs, then smaller reduced chi-square.
+            accepted = [attempt for attempt in attempts if attempt[-1] == "accepted"]
+            _, _, fit, active, delta_bic, status = max(accepted or attempts, key=lambda item: item[:2])
+            output.update({"trial_" + key: fit[key] for key in trial_fields})
+            output.update(baseline_status=status, baseline_nband=float(len(active)),
+                          baseline_delta_bic=delta_bic)
+            if not accepted:
+                return normalize_salt_output(output)  # Keep the failed trial for diagnosis only.
             output.update({key: fit[key] for key in saltres_cols[:-2]})
             output.update(fit_error="None", baseline_recovered=1.0, fit_model="salt3_plus_band_reference",
-                          baseline_status="accepted", baseline_nband=float(len(active)),
-                          baseline_delta_bic=delta_bic)
+                          baseline_status="accepted")
             for band in active:
                 output["baseline_" + band] = fit["ref" + band]
                 output["baseline_" + band + "_err"] = fit["ref" + band + "_err"]
